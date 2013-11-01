@@ -21,7 +21,10 @@
 #include <sys/types.h>
 
 #include <EGL/egl.h>
-#include <GLES/gl.h>
+
+/*
+ * NOTE: Make sure this file doesn't include  anything from <gl/ > or <gl2/ >
+ */
 
 #include <cutils/compiler.h>
 
@@ -32,7 +35,6 @@
 #include <utils/SortedVector.h>
 #include <utils/threads.h>
 
-#include <binder/BinderService.h>
 #include <binder/IMemory.h>
 
 #include <ui/PixelFormat.h>
@@ -46,10 +48,12 @@
 
 #include "Barrier.h"
 #include "DisplayDevice.h"
+#include "DispSync.h"
 #include "FrameTracker.h"
 #include "MessageQueue.h"
 
 #include "DisplayHardware/HWComposer.h"
+#include "Effects/Daltonizer.h"
 
 #ifdef SAMSUNG_HDMI_SUPPORT
 #include "SecHdmiClient.h"
@@ -66,6 +70,8 @@ class IGraphicBufferAlloc;
 class Layer;
 class LayerDim;
 class Surface;
+class RenderEngine;
+class EventControlThread;
 
 // ---------------------------------------------------------------------------
 
@@ -76,18 +82,22 @@ enum {
     eTransactionMask          = 0x07
 };
 
-class SurfaceFlinger : public BinderService<SurfaceFlinger>,
-                       public BnSurfaceComposer,
+class SurfaceFlinger : public BnSurfaceComposer,
                        private IBinder::DeathRecipient,
-                       private Thread,
                        private HWComposer::EventHandler
 {
 public:
-    static char const* getServiceName() {
+    static char const* getServiceName() ANDROID_API {
         return "SurfaceFlinger";
     }
 
-    SurfaceFlinger();
+    SurfaceFlinger() ANDROID_API;
+
+    // must be called before clients can connect
+    void init() ANDROID_API;
+
+    // starts SurfaceFlinger main loop in the current thread
+    void run() ANDROID_API;
 
     enum {
         EVENT_VSYNC = HWC_EVENT_VSYNC,
@@ -95,12 +105,10 @@ public:
     };
 
     // post an asynchronous message to the main thread
-    status_t postMessageAsync(const sp<MessageBase>& msg, nsecs_t reltime = 0,
-        uint32_t flags = 0);
+    status_t postMessageAsync(const sp<MessageBase>& msg, nsecs_t reltime = 0, uint32_t flags = 0);
 
     // post a synchronous message to the main thread
-    status_t postMessageSync(const sp<MessageBase>& msg, nsecs_t reltime = 0,
-        uint32_t flags = 0);
+    status_t postMessageSync(const sp<MessageBase>& msg, nsecs_t reltime = 0, uint32_t flags = 0);
 
     // force full composition on all displays
     void repaintEverything();
@@ -111,7 +119,7 @@ public:
     }
 
     // utility function to delete a texture on the main thread
-    void deleteTextureAsync(GLuint texture);
+    void deleteTextureAsync(uint32_t texture);
 
     // enable/disable h/w composer event
     // TODO: this should be made accessible only to EventThread
@@ -126,11 +134,19 @@ public:
     // TODO: this should be made accessible only to HWComposer
     const Vector< sp<Layer> >& getLayerSortedByZForHwcDisplay(int id);
 
+    RenderEngine& getRenderEngine() const {
+        return *mRenderEngine;
+    }
+
 private:
     friend class Client;
     friend class DisplayEventConnection;
     friend class Layer;
     friend class SurfaceTextureLayer;
+
+    // This value is specified in number of frames.  Log frame stats at most
+    // every half hour.
+    enum { LOG_FRAME_STATS_PERIOD =  30*60*60 };
 
     // We're reference counted, never destroy SurfaceFlinger directly
     virtual ~SurfaceFlinger();
@@ -180,6 +196,7 @@ private:
     virtual sp<ISurfaceComposerClient> createConnection();
     virtual sp<IGraphicBufferAlloc> createGraphicBufferAlloc();
     virtual sp<IBinder> createDisplay(const String8& displayName, bool secure);
+    virtual void destroyDisplay(const sp<IBinder>& display);
     virtual sp<IBinder> getBuiltInDisplay(int32_t id);
     virtual void setTransactionState(const Vector<ComposerState>& state,
             const Vector<DisplayState>& displays, uint32_t flags);
@@ -190,12 +207,7 @@ private:
     virtual status_t captureScreen(const sp<IBinder>& display,
             const sp<IGraphicBufferProducer>& producer,
             uint32_t reqWidth, uint32_t reqHeight,
-            uint32_t minLayerZ, uint32_t maxLayerZ, bool isCpuConsumer);
-#ifdef BOARD_EGL_NEEDS_LEGACY_FB
-    virtual status_t captureScreen(const sp<IBinder>& display, sp<IMemoryHeap>* heap,
-        uint32_t* width, uint32_t* height, uint32_t reqWidth,
-        uint32_t reqHeight, uint32_t minLayerZ, uint32_t maxLayerZ);
-#endif
+            uint32_t minLayerZ, uint32_t maxLayerZ);
     // called when screen needs to turn off
     virtual void blank(const sp<IBinder>& display);
     // called when screen is turning back on
@@ -208,10 +220,8 @@ private:
     virtual void binderDied(const wp<IBinder>& who);
 
     /* ------------------------------------------------------------------------
-     * Thread interface
+     * RefBase interface
      */
-    virtual bool threadLoop();
-    virtual status_t readyToRun();
     virtual void onFirstRef();
 
     /* ------------------------------------------------------------------------
@@ -259,8 +269,7 @@ private:
     uint32_t peekTransactionFlags(uint32_t flags);
     uint32_t setTransactionFlags(uint32_t flags);
     void commitTransaction();
-    uint32_t setClientStateLocked(const sp<Client>& client,
-        const layer_state_t& s);
+    uint32_t setClientStateLocked(const sp<Client>& client, const layer_state_t& s);
     uint32_t setDisplayStateLocked(const DisplayState& s);
 
     /* ------------------------------------------------------------------------
@@ -315,28 +324,15 @@ private:
             uint32_t reqWidth, uint32_t reqHeight,
             uint32_t minLayerZ, uint32_t maxLayerZ);
 
-    status_t captureScreenImplCpuConsumerLocked(
-            const sp<const DisplayDevice>& hw,
-#ifdef BOARD_EGL_NEEDS_LEGACY_FB
-            sp<IMemoryHeap>* heap, uint32_t* width, uint32_t* height,
-#else
-            const sp<IGraphicBufferProducer>& producer,
-#endif
-            uint32_t reqWidth, uint32_t reqHeight,
-            uint32_t minLayerZ, uint32_t maxLayerZ);
-
-
     /* ------------------------------------------------------------------------
      * EGL
      */
     static status_t selectConfigForAttribute(EGLDisplay dpy,
         EGLint const* attrs, EGLint attribute, EGLint value, EGLConfig* outConfig);
-    static EGLConfig selectEGLConfig(EGLDisplay disp, EGLint visualId);
-    static EGLContext createGLContext(EGLDisplay disp, EGLConfig config);
-    void initializeGL(EGLDisplay display);
-    uint32_t getMaxTextureSize() const;
-    uint32_t getMinColorDepth() const;
-    uint32_t getMaxViewportDims() const;
+    static status_t selectEGLConfig(EGLDisplay disp, EGLint visualId,
+        EGLint renderableType, EGLConfig* config);
+    size_t getMaxTextureSize() const;
+    size_t getMaxViewportDims() const;
 
     // 0: surface doesn't need dithering, 1: use if necessary
     inline int getUseDithering() const { return mUseDithering; }
@@ -387,35 +383,37 @@ private:
     void setUpHWComposer();
     void doComposition();
     void doDebugFlashRegions();
-    void doDisplayComposition(const sp<const DisplayDevice>& hw,
-            const Region& dirtyRegion);
-    void doComposeSurfaces(const sp<const DisplayDevice>& hw,
-            const Region& dirty);
+    void doDisplayComposition(const sp<const DisplayDevice>& hw, const Region& dirtyRegion);
+    void doComposeSurfaces(const sp<const DisplayDevice>& hw, const Region& dirty);
 
     void postFramebuffer();
-    void drawWormhole(const sp<const DisplayDevice>& hw,
-            const Region& region) const;
-    GLuint getProtectedTexName() const {
-        return mProtectedTexName;
-    }
+    void drawWormhole(const sp<const DisplayDevice>& hw, const Region& region) const;
 
     /* ------------------------------------------------------------------------
      * Display management
      */
 
+    /* ------------------------------------------------------------------------
+     * VSync
+     */
+     void enableHardwareVsync();
+     void disableHardwareVsync(bool makeUnavailable);
+     void resyncToHardwareVsync(bool makeAvailable);
 
     /* ------------------------------------------------------------------------
      * Debugging & dumpsys
      */
-    void listLayersLocked(const Vector<String16>& args, size_t& index,
-        String8& result, char* buffer, size_t SIZE) const;
-    void dumpStatsLocked(const Vector<String16>& args, size_t& index,
-        String8& result, char* buffer, size_t SIZE) const;
-    void clearStatsLocked(const Vector<String16>& args, size_t& index,
-        String8& result, char* buffer, size_t SIZE);
-    void dumpAllLocked(String8& result, char* buffer, size_t SIZE) const;
+    void listLayersLocked(const Vector<String16>& args, size_t& index, String8& result) const;
+    void dumpStatsLocked(const Vector<String16>& args, size_t& index, String8& result) const;
+    void clearStatsLocked(const Vector<String16>& args, size_t& index, String8& result);
+    void dumpAllLocked(const Vector<String16>& args, size_t& index, String8& result) const;
     bool startDdmConnection();
     static void appendSfConfigString(String8& result);
+    void checkScreenshot(size_t w, size_t s, size_t h, void const* vaddr,
+            const sp<const DisplayDevice>& hw,
+            uint32_t minLayerZ, uint32_t maxLayerZ);
+
+    void logFrameStats();
 
     /* ------------------------------------------------------------------------
      * Attributes
@@ -439,18 +437,17 @@ private:
 
     // constant members (no synchronization needed for access)
     HWComposer* mHwc;
-    GLuint mProtectedTexName;
+    RenderEngine* mRenderEngine;
     nsecs_t mBootTime;
     bool mGpuToCpuSupported;
     sp<EventThread> mEventThread;
-    GLint mMaxViewportDims[2];
-    GLint mMaxTextureSize;
-    GLint mMinColorDepth;
+    sp<EventThread> mSFEventThread;
+    sp<EventControlThread> mEventControlThread;
     EGLContext mEGLContext;
     EGLConfig mEGLConfig;
     EGLDisplay mEGLDisplay;
     EGLint mEGLNativeVisualId;
-    sp<IBinder> mBuiltinDisplays[DisplayDevice::NUM_DISPLAY_TYPES];
+    sp<IBinder> mBuiltinDisplays[DisplayDevice::NUM_BUILTIN_DISPLAY_TYPES];
 
     // Can only accessed from the main thread, these members
     // don't need synchronization
@@ -477,24 +474,26 @@ private:
 
     // these are thread safe
     mutable MessageQueue mEventQueue;
-    mutable Barrier mReadyToRunBarrier;
     FrameTracker mAnimFrameTracker;
+    DispSync mPrimaryDispSync;
 
     // protected by mDestroyedLayerLock;
     mutable Mutex mDestroyedLayerLock;
     Vector<Layer const *> mDestroyedLayers;
 
+    // protected by mHWVsyncLock
+    Mutex mHWVsyncLock;
+    bool mPrimaryHWVsyncEnabled;
+    bool mHWVsyncAvailable;
+
     /* ------------------------------------------------------------------------
      * Feature prototyping
      */
 
-    sp<IBinder> mExtDisplayToken;
-#if defined(SAMSUNG_HDMI_SUPPORT) && defined(SAMSUNG_EXYNOS5250)
-    SecHdmiClient *                         mHdmiClient;
-#endif
+    Daltonizer mDaltonizer;
+    bool mDaltonize;
 };
 
-// ---------------------------------------------------------------------------
 }; // namespace android
 
 #endif // ANDROID_SURFACE_FLINGER_H

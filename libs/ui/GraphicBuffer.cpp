@@ -36,12 +36,11 @@ namespace android {
 
 GraphicBuffer::GraphicBuffer()
     : BASE(), mOwner(ownData), mBufferMapper(GraphicBufferMapper::get()),
-      mInitCheck(NO_ERROR), mIndex(-1)
-{
-    width  =
-    height =
-    stride =
-    format =
+      mInitCheck(NO_ERROR) {
+    width  = 
+    height = 
+    stride = 
+    format = 
     usage  = 0;
     handle = NULL;
 }
@@ -49,7 +48,7 @@ GraphicBuffer::GraphicBuffer()
 GraphicBuffer::GraphicBuffer(uint32_t w, uint32_t h,
         PixelFormat reqFormat, uint32_t reqUsage)
     : BASE(), mOwner(ownData), mBufferMapper(GraphicBufferMapper::get()),
-      mInitCheck(NO_ERROR), mIndex(-1)
+      mInitCheck(NO_ERROR)
 {
     width  =
     height =
@@ -79,7 +78,7 @@ GraphicBuffer::GraphicBuffer(uint32_t w, uint32_t h,
         uint32_t inStride, native_handle_t* inHandle, bool keepOwnership)
     : BASE(), mOwner(keepOwnership ? ownHandle : ownNone),
       mBufferMapper(GraphicBufferMapper::get()),
-      mInitCheck(NO_ERROR), mIndex(-1)
+      mInitCheck(NO_ERROR)
 {
     width  = w;
     height = h;
@@ -92,7 +91,7 @@ GraphicBuffer::GraphicBuffer(uint32_t w, uint32_t h,
 GraphicBuffer::GraphicBuffer(ANativeWindowBuffer* buffer, bool keepOwnership)
     : BASE(), mOwner(keepOwnership ? ownHandle : ownNone),
       mBufferMapper(GraphicBufferMapper::get()),
-      mInitCheck(NO_ERROR), mIndex(-1), mWrappedBuffer(buffer)
+      mInitCheck(NO_ERROR), mWrappedBuffer(buffer)
 {
     width  = buffer->width;
     height = buffer->height;
@@ -250,9 +249,7 @@ size_t GraphicBuffer::getFdCount() const {
     return handle ? handle->numFds : 0;
 }
 
-status_t GraphicBuffer::flatten(void* buffer, size_t size,
-        int fds[], size_t count) const
-{
+status_t GraphicBuffer::flatten(void*& buffer, size_t& size, int*& fds, size_t& count) const {
     size_t sizeNeeded = GraphicBuffer::getFlattenedSize();
     if (size < sizeNeeded) return NO_MEMORY;
 
@@ -277,12 +274,16 @@ status_t GraphicBuffer::flatten(void* buffer, size_t size,
         memcpy(&buf[8], h->data + h->numFds, h->numInts*sizeof(int));
     }
 
+    buffer = reinterpret_cast<void*>(static_cast<int*>(buffer) + sizeNeeded);
+    size -= sizeNeeded;
+    fds += handle->numFds;
+    count -= handle->numFds;
+
     return NO_ERROR;
 }
 
-status_t GraphicBuffer::unflatten(void const* buffer, size_t size,
-        int fds[], size_t count)
-{
+status_t GraphicBuffer::unflatten(
+        void const*& buffer, size_t& size, int const*& fds, size_t& count) {
     if (size < 8*sizeof(int)) return NO_MEMORY;
 
     int const* buf = static_cast<int const*>(buffer);
@@ -328,16 +329,12 @@ status_t GraphicBuffer::unflatten(void const* buffer, size_t size,
         }
     }
 
+    buffer = reinterpret_cast<void const*>(static_cast<int const*>(buffer) + sizeNeeded);
+    size -= sizeNeeded;
+    fds += numFds;
+    count -= numFds;
+
     return NO_ERROR;
-}
-
-
-void GraphicBuffer::setIndex(int index) {
-    mIndex = index;
-}
-
-int GraphicBuffer::getIndex() const {
-    return mIndex;
 }
 
 // ---------------------------------------------------------------------------
